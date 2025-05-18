@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>DODO Flash Loan Arbitrage</title>
+    <script src="https://cdn.jsdelivr.net/npm/ethers@6.7.0/dist/ethers.umd.min.js"></script>
+    <style>
+        body { background-color: #0a1f0a; color: white; font-family: Arial, sans-serif; padding: 20px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 10px; border: 1px solid #333; text-align: center; }
+        th { background-color: #004d00; }
+        .profitable { background-color: #006600; color: white; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h2>DODO Flash Loan Arbitrage</h2>
+    <button onclick="connectWallet()">Connect Wallet</button>
+    <label>
+        <input type="checkbox" id="autotrade" /> Auto Trade if Profitable
+    </label>
+    <table id="resultsTable">
+        <thead>
+            <tr>
+                <th>Token</th>
+                <th>Buy DEX</th>
+                <th>Sell DEX</th>
+                <th>Buy Price (USDC)</th>
+                <th>Sell Price (USDC)</th>
+                <th>Profit (USDC)</th>
+                <th>Status</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <script>
+        const provider = new ethers.BrowserProvider(window.ethereum);
+        let signer;
+
+        const flashLoanAddress = "0xe0A6d56Fbc4a4E4E94E0D2B9D52adc323Dfa55Ee";
+        const usdc = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+        const tokens = [
+            { symbol: "SAND", address: "0xBBba073C31bF03b8ACf7c28EF0738DeCF3695683", decimals: 18 },
+            { symbol: "LINK", address: "0x53e0bca35ec356bd5dddfebbd1fc0fd03fabad39", decimals: 18 },
+            { symbol: "AAVE", address: "0xd6df932a45c0f255f85145f286ea0b292b21c90b", decimals: 18 }
+        ];
+        const routers = [
+            { name: "QuickSwap", address: "0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff" },
+            { name: "SushiSwap", address: "0x1b02da8cb0d097eb8d57a175b88c7d8b47997506" },
+            { name: "Uniswap", address: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45" }
+        ];
+
+        const abi = [
+            {
+                "inputs": [
+                    { "internalType": "address", "name": "token", "type": "address" },
+                    { "internalType": "uint256", "name": "amount", "type": "uint256" },
+                    { "internalType": "bool", "name": "buyOnQuickSwap", "type": "bool" },
+                    { "internalType": "bool", "name": "sellOnQuickSwap", "type": "bool" }
+                ],
+                "name": "executeArbitrage",
+                "outputs": [],
+                "stateMutability": "nonpayable",
+                "type": "function"
+            }
+        ];
+
+        async function connectWallet() {
+            await provider.send("eth_requestAccounts", []);
+            signer = await provider.getSigner();
+            const address = await signer.getAddress();
+            alert("Wallet connected: " + address);
+        }
+
+        async function getPrice(router, tokenIn, tokenOut, amountIn, inDecimals, outDecimals) {
+            try {
+                const contract = new ethers.Contract(router.address, [
+                    "function getAmountsOut(uint amountIn, address[] calldata path) external view returns (uint[] memory amounts)"
+                ], provider);
+                const path = [tokenIn, tokenOut];
+                const amounts = await contract.getAmountsOut(amountIn, path);
+                const amountInNorm = parseFloat(ethers.formatUnits(amountIn, inDecimals));
+                const amountOutNorm = parseFloat(ethers.formatUnits(amounts[1], outDecimals));
+                const price = tokenIn === usdc
+                    ? amountOutNorm / amountInNorm
+                    : amountInNorm / amountOutNorm;
+                return price;
+            } catch (err) {
+                console.warn("Price fetch error for", tokenIn, "->", tokenOut, ":", err);
+                return 0;
+            }
+        }
+
+        async function loop() {
+            if (!signer) return;
+            const tbody = document.querySelector("#resultsTable tbody");
+            tbody.innerHTML = "";
+            const amountIn = ethers.parseUnits("10", 6); // 10 USDC
+
+            for (let token of tokens) {
+                for (let buyRouter of routers) {
+                    const buyPrice = await getPrice(buyRouter, usdc, token.address, amountIn, 6, token.decimals);
+                    if (buyPrice === 0) continue;
+
+                    const tokenAmount = ethers.parseUnits(buyPrice.toString(), token.decimals);
+
+                    for (let sellRouter of routers) {
+                        if (buyRouter.name === sellRouter.name) continue;
+
+                        const sellPrice = await getPrice(sellRouter, token.address, usdc, tokenAmount, token.decimals, 6);
+                        if (sellPrice === 0) continue;
+
+                        const profit = sellPrice - 10;
+                        const row = document.createElement("tr");
+                        if (profit > 0) row.classList.add("profitable");
+
+                        row.innerHTML = `
+                            <td>${token.symbol}</td>
+                            <td>${buyRouter.name}</td>
+                            <td>${sellRouter.name}</td>
+                            <td>${buyPrice.toFixed(4)}</td>
+                            <td>${sellPrice.toFixed(4)}</td>
+                            <td>${profit.toFixed(4)}</td>
+                            <td>${profit > 0 ? "Profitable" : "Not Profitable"}</td>
+                        `;
+                        tbody.appendChild(row);
+
+                        if (profit > 0 && document.getElementById("autotrade").checked) {
+                            try {
+                                const flashLoanContract = new ethers.Contract(flashLoanAddress, abi, signer);
+                                const tx = await flashLoanContract.executeArbitrage(
+                                    token.address,
+                                    tokenAmount,
+                                    buyRouter.name === "QuickSwap",
+                                    sellRouter.name === "QuickSwap"
+                                );
+                                alert(`Trade triggered: ${token.symbol} | TX: ${tx.hash}`);
+                                await tx.wait();
+                            } catch (err) {
+                                console.error("Transaction failed:", err);
+                                alert("Trade failed. See console.");
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        setInterval(loop, 10000); // Run every 10 seconds
+    </script>
+</body>
+</html>
